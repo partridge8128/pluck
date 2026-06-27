@@ -1373,6 +1373,31 @@ body {
   flex: 1;
   overflow: auto;
 }
+/* Graph view — structure picture */
+.graph-wrap { flex: 1; min-height: 0; display: flex; flex-direction: column; position: relative; overflow: hidden; background: var(--panel-soft); }
+.graph-toolbar { display: flex; align-items: center; gap: 12px; padding: 6px 10px; border-bottom: 1px solid var(--border); font-size: 11px; color: var(--fg-3); background: var(--well); flex: 0 0 auto; }
+.graph-btn { background: var(--bg-rise-2); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 3px 9px; cursor: pointer; font: inherit; }
+.graph-btn:hover { border-color: var(--border-bright); }
+.graph-hint { color: var(--fg-4); }
+.graph-trunc { color: var(--peach); margin-left: auto; }
+.graph-svg { flex: 1; width: 100%; height: 100%; cursor: grab; display: block; user-select: none; }
+.graph-wrap.panning .graph-svg { cursor: grabbing; }
+.graph-empty { margin: auto; color: var(--fg-3); padding: 40px; }
+.gedge { fill: none; stroke: var(--border-bright); stroke-width: 1.2; opacity: 0.6; }
+.gnode { cursor: pointer; }
+.gbox { fill: var(--bg-rise); stroke: var(--border); }
+.gnode:hover .gbox { stroke: var(--border-bright); }
+.gnode.selected .gbox { stroke: var(--mint); stroke-width: 2; }
+.glabel { font-family: var(--f-mono); font-size: 11px; fill: var(--fg); dominant-baseline: central; }
+.gmeta { fill: var(--fg-3); }
+.gtoggle { font-family: var(--f-mono); font-size: 11px; fill: var(--fg-2); cursor: pointer; dominant-baseline: central; text-anchor: middle; }
+.gobject .glabel { fill: var(--t-key); }
+.garray .glabel { fill: var(--t-index); }
+.gleaf .glabel { fill: var(--fg); }
+.gleaf.t-string .glabel  { fill: var(--t-string); }
+.gleaf.t-number .glabel  { fill: var(--t-number); }
+.gleaf.t-boolean .glabel { fill: var(--t-boolean); }
+.gleaf.t-null .glabel    { fill: var(--t-null); }
 .raw-view {
   font-family: var(--f-mono);
   font-size: 12px;
@@ -2301,7 +2326,7 @@ mark.hl {
     <div class="brand">
       <span class="brand-mark"></span>
       <span class="brand-name">Pluck<b>JSON</b></span>
-      <span class="brand-ver">v3</span>
+      <span class="brand-ver">v4</span>
       <span class="mod-badge" id="modified-badge" style="display:none" title="Click to reset">0 edits</span>
       <span class="parser-badge" id="parser-badge" style="display:none" title="Active lenient parser — click to switch back to strict">json5<span class="x">×</span></span>
       <span class="persist-indicator" id="persist-indicator" title="Click for privacy / data settings">🔒 session-only</span>
@@ -2448,6 +2473,7 @@ mark.hl {
         <div class="view-tabs" id="view-tabs">
           <button class="view-tab active" data-view="tree" title="Hierarchical tree">Tree</button>
           <button class="view-tab" data-view="table" title="Tabular view (when array of objects)">Table</button>
+          <button class="view-tab" data-view="graph" title="Structure graph — the shape of the JSON">Graph</button>
           <button class="view-tab" data-view="raw" title="Raw JSON text">Raw</button>
         </div>
         <div class="pane-actions">
@@ -2463,6 +2489,7 @@ mark.hl {
         <div id="tree" class="tree"></div>
       </div>
       <div class="table-wrap" id="table-wrap" style="display:none"></div>
+      <div class="graph-wrap" id="graph-wrap" style="display:none"></div>
       <div class="raw-wrap" id="raw-wrap" style="display:none"></div>
     </section>
 
@@ -3475,15 +3502,17 @@ function renderPrimitiveHtml(value, type, path) {
 const TABLE_PAGE = 2000;   // rows rendered per page in Table view
 
 function setViewMode(mode) {
-  if (mode !== 'tree' && mode !== 'table' && mode !== 'raw') return;
+  if (mode !== 'tree' && mode !== 'table' && mode !== 'raw' && mode !== 'graph') return;
   state.viewMode = mode;
   document.querySelectorAll('.view-tab').forEach(t => t.classList.toggle('active', t.dataset.view === mode));
   const tw = document.getElementById('tree-wrap');
   const tbw = document.getElementById('table-wrap');
   const rw = document.getElementById('raw-wrap');
+  const gw = document.getElementById('graph-wrap');
   tw.style.display  = mode === 'tree'  ? '' : 'none';
   tbw.style.display = mode === 'table' ? 'flex' : 'none';
   rw.style.display  = mode === 'raw'   ? '' : 'none';
+  if (gw) gw.style.display = mode === 'graph' ? 'flex' : 'none';
   rerenderActiveView();
   saveStateDebounced();
 }
@@ -3491,6 +3520,156 @@ function rerenderActiveView() {
   if (state.viewMode === 'tree') { renderTree(); applyHighlights(); }
   else if (state.viewMode === 'table') renderTable();
   else if (state.viewMode === 'raw') renderRaw();
+  else if (state.viewMode === 'graph') renderGraph();
+}
+
+// ============================================================
+//  GRAPH VIEW — structure picture (collapsible SVG tidy-tree)
+//  Shows the *shape* of the JSON: objects expand to their keys,
+//  arrays collapse to one representative element ×N. Clicking a
+//  node calls selectPath() so Tree / Filter / Build-a-Table all
+//  light up. Hand-rolled SVG (no external libs) — JSON is a tree.
+// ============================================================
+const GPH = { X_GAP:170, Y_GAP:28, NODE_H:22, CHAR:6.7,
+              D_INIT:2, CHILD_CAP:200, SAMPLE_N:50, MAX_NODES:4000 };
+let gphRoot = null, gphExpanded = new Set(), gphSelId = null, gphLastData = undefined;
+let gphView = { tx:30, ty:20, scale:1 }, gphNodeId = 0, gphTruncated = false, gphFitPending = true, gphBound = false;
+
+function gphNodeWidth(n){
+  const meta = n.kind === 'array' ? (2 + String(n.count).length)
+             : n.kind === 'object' ? 3
+             : (2 + n.type.length);
+  return Math.max(50, (n.key.length + meta) * GPH.CHAR + 20);
+}
+function gphLabel(n){
+  const k = escapeHtml(n.key);
+  if (n.kind === 'array')  return `${k} <tspan class="gmeta">×${n.count}</tspan>`;
+  if (n.kind === 'object') return `${k} <tspan class="gmeta">{}</tspan>`;
+  return `${k}<tspan class="gmeta">: ${escapeHtml(n.type)}</tspan>`;
+}
+
+// Build the structure model. Arrays collapse to a representative
+// shape (key-union over a sample); paths are concrete (index 0 at
+// array hops) so selectPath()/Build-a-Table work unchanged.
+function gphBuild(root){
+  gphNodeId = 0; gphTruncated = false;
+  let budget = GPH.MAX_NODES;
+  function make(key, val, path){
+    if (budget-- <= 0){ gphTruncated = true; return null; }
+    const kind = $type(val);
+    const n = { id: ++gphNodeId, key, path, kind, type: kind, count: 0, children: [] };
+    if (kind === 'object'){
+      const keys = Object.keys(val).slice(0, GPH.CHILD_CAP);
+      if (Object.keys(val).length > keys.length) gphTruncated = true;
+      for (const k of keys){ const c = make(k, val[k], pathJoin(path, k, false)); if (c) n.children.push(c); }
+    } else if (kind === 'array'){
+      n.count = val.length;
+      if (val.length){
+        const sample = val.slice(0, GPH.SAMPLE_N);
+        const repPath = pathJoin(path, 0, true);
+        const allObjects = sample.every(e => e && typeof e === 'object' && !Array.isArray(e));
+        if (allObjects){
+          const order = [], seen = new Set();
+          for (const e of sample) for (const k of Object.keys(e)) if (!seen.has(k)){ seen.add(k); order.push(k); }
+          const keys = order.slice(0, GPH.CHILD_CAP);
+          if (order.length > keys.length) gphTruncated = true;
+          for (const k of keys){
+            let ev; for (const e of sample){ if (e && Object.prototype.hasOwnProperty.call(e, k)){ ev = e[k]; break; } }
+            const c = make(k, ev, pathJoin(repPath, k, false)); if (c) n.children.push(c);
+          }
+        } else {
+          const kinds = new Set(sample.map($type));
+          const t = kinds.size === 1 ? [...kinds][0] : 'mixed';
+          n.children.push({ id: ++gphNodeId, key:'[ ]', path: repPath, kind:'leaf', type: t, count: 0, children: [] });
+        }
+      }
+    } else {
+      n.kind = 'leaf'; n.type = kind;
+    }
+    return n;
+  }
+  return make('root', root, '$');
+}
+function gphInitExpand(){
+  gphExpanded = new Set();
+  (function walk(n, d){ if (!n) return; if (d < GPH.D_INIT && n.children.length) gphExpanded.add(n.id); n.children.forEach(c => walk(c, d + 1)); })(gphRoot, 0);
+}
+// Tidy layout: leaves on a row grid, parents centered on children.
+function gphLayout(){
+  let yc = 0; const nodes = [], edges = [];
+  (function place(n, depth){
+    n.x = depth * GPH.X_GAP;
+    const open = gphExpanded.has(n.id) && n.children.length;
+    if (!open){ n.y = yc * GPH.Y_GAP; yc++; }
+    else { n.children.forEach(c => place(c, depth + 1)); n.y = (n.children[0].y + n.children[n.children.length - 1].y) / 2; }
+    nodes.push(n);
+    if (open) n.children.forEach(c => edges.push({ a: n, b: c }));
+  })(gphRoot, 0);
+  return { nodes, edges };
+}
+function gphApplyTransform(){
+  const g = document.getElementById('graph-pan');
+  if (g) g.setAttribute('transform', `translate(${gphView.tx},${gphView.ty}) scale(${gphView.scale})`);
+}
+function gphFit(nodes){
+  const svg = document.getElementById('graph-svg'); if (!svg || !nodes.length) return;
+  let minX=1e9,minY=1e9,maxX=-1e9,maxY=-1e9;
+  for (const n of nodes){ minX=Math.min(minX,n.x); minY=Math.min(minY,n.y); maxX=Math.max(maxX,n.x+gphNodeWidth(n)); maxY=Math.max(maxY,n.y+GPH.NODE_H); }
+  const r = svg.getBoundingClientRect();
+  const scale = Math.min(1.2, Math.max(0.2, Math.min((r.width-40)/(maxX-minX||1), (r.height-40)/(maxY-minY||1))));
+  gphView = { scale, tx: 20 - minX*scale, ty: 20 - minY*scale };
+  gphApplyTransform();
+}
+function renderGraph(){
+  const wrap = document.getElementById('graph-wrap'); if (!wrap) return;
+  if (state.data == null){ wrap.innerHTML = '<div class="graph-empty">Load JSON to see its structure.</div>'; return; }
+  if (gphLastData !== state.data){ gphLastData = state.data; gphRoot = gphBuild(state.data); gphInitExpand(); gphSelId = null; gphFitPending = true; }
+  const { nodes, edges } = gphLayout();
+  let body = '';
+  for (const e of edges){
+    const x1 = e.a.x + gphNodeWidth(e.a), y1 = e.a.y + GPH.NODE_H/2, x2 = e.b.x, y2 = e.b.y + GPH.NODE_H/2, mx = (x1+x2)/2;
+    body += `<path class="gedge" d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}"/>`;
+  }
+  for (const n of nodes){
+    const w = gphNodeWidth(n), open = gphExpanded.has(n.id) && n.children.length;
+    const cls = n.kind === 'leaf' ? `gleaf t-${n.type}` : (n.kind === 'array' ? 'garray' : 'gobject');
+    const toggle = n.children.length ? `<text class="gtoggle" data-id="${n.id}" x="-10" y="${GPH.NODE_H/2}">${open?'▾':'▸'}</text>` : '';
+    body += `<g class="gnode ${cls}${n.id===gphSelId?' selected':''}" data-id="${n.id}" data-path="${escapeHtml(n.path)}" transform="translate(${n.x},${n.y})">`
+          + toggle
+          + `<rect class="gbox" width="${w}" height="${GPH.NODE_H}" rx="4"/>`
+          + `<text class="glabel" x="8" y="${GPH.NODE_H/2}">${gphLabel(n)}</text></g>`;
+  }
+  wrap.innerHTML =
+      `<div class="graph-toolbar"><button id="graph-fit" class="graph-btn">⌖ Fit</button>`
+    + `<span class="graph-hint">drag to pan · scroll to zoom · click a node to select</span>`
+    + (gphTruncated ? `<span class="graph-trunc">⚠ large structure — some branches hidden</span>` : '')
+    + `</div><svg id="graph-svg" class="graph-svg"><g id="graph-pan">${body}</g></svg>`;
+  gphApplyTransform();
+  if (gphFitPending){ gphFit(nodes); gphFitPending = false; }
+  gphBindOnce();
+}
+function gphBindOnce(){
+  if (gphBound) return; gphBound = true;
+  const wrap = document.getElementById('graph-wrap');
+  wrap.addEventListener('click', (e) => {
+    if (e.target.closest('#graph-fit')){ gphFit(gphLayout().nodes); return; }
+    const tog = e.target.closest('.gtoggle');
+    if (tog){ const id = +tog.dataset.id; if (gphExpanded.has(id)) gphExpanded.delete(id); else gphExpanded.add(id); renderGraph(); return; }
+    const gn = e.target.closest('.gnode');
+    if (gn){ gphSelId = +gn.dataset.id; selectPath(gn.dataset.path); renderGraph(); }
+  });
+  let drag = null;
+  wrap.addEventListener('mousedown', (e) => { if (e.target.closest('.gnode') || e.target.closest('.graph-toolbar')) return; drag = { x:e.clientX, y:e.clientY, tx:gphView.tx, ty:gphView.ty }; wrap.classList.add('panning'); });
+  window.addEventListener('mousemove', (e) => { if (!drag) return; gphView.tx = drag.tx + (e.clientX - drag.x); gphView.ty = drag.ty + (e.clientY - drag.y); gphApplyTransform(); });
+  window.addEventListener('mouseup', () => { if (drag){ drag = null; wrap.classList.remove('panning'); } });
+  wrap.addEventListener('wheel', (e) => {
+    const svg = document.getElementById('graph-svg'); if (!svg) return; e.preventDefault();
+    const r = svg.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
+    const ns = Math.min(2.5, Math.max(0.1, gphView.scale * (e.deltaY < 0 ? 1.1 : 1/1.1)));
+    gphView.tx = mx - (mx - gphView.tx) * (ns / gphView.scale);
+    gphView.ty = my - (my - gphView.ty) * (ns / gphView.scale);
+    gphView.scale = ns; gphApplyTransform();
+  }, { passive: false });
 }
 
 function isTableable(value) {
@@ -5107,6 +5286,7 @@ const COMMANDS = [
   { group: 'View',     title: 'Toggle light/dark theme',    sub: 'Atom One Dark ↔ Atom One Light',         icon: '◐', run: toggleTheme },
   { group: 'View',     title: 'Tree view',                  sub: 'Hierarchical tree (default)',            icon: '⌐', run: () => setViewMode('tree') },
   { group: 'View',     title: 'Table view',                 sub: 'Tabular layout — when result is array of objects', icon: '▦', run: () => setViewMode('table') },
+  { group: 'View',     title: 'Graph view',                 sub: 'Structure picture — the shape of the JSON',  icon: '◫', run: () => setViewMode('graph') },
   { group: 'View',     title: 'Raw JSON view',              sub: 'Pretty-printed JSON text',                icon: '{}', run: () => setViewMode('raw') },
   { group: 'Parser',   title: 'Strict JSON',                sub: 'RFC-8259 — quoted keys, no comments',    icon: '⊙', run: () => setParserMode('strict') },
   { group: 'Parser',   title: 'JSONC (JSON + comments)',    sub: 'Allow // and /* */ + trailing commas',   icon: '◐', run: () => setParserMode('jsonc') },
@@ -5329,15 +5509,17 @@ function loadPersistedState() {
         state.parserMode = p.parserMode;
       }
       // Restore view mode + sort before render (so initial parse renders the right view)
-      if (p.viewMode === 'tree' || p.viewMode === 'table' || p.viewMode === 'raw') {
+      if (p.viewMode === 'tree' || p.viewMode === 'table' || p.viewMode === 'raw' || p.viewMode === 'graph') {
         state.viewMode = p.viewMode;
         document.querySelectorAll('.view-tab').forEach(t => t.classList.toggle('active', t.dataset.view === p.viewMode));
         const tw = document.getElementById('tree-wrap');
         const tbw = document.getElementById('table-wrap');
         const rw = document.getElementById('raw-wrap');
+        const gw = document.getElementById('graph-wrap');
         if (tw) tw.style.display  = p.viewMode === 'tree'  ? '' : 'none';
         if (tbw) tbw.style.display = p.viewMode === 'table' ? 'flex' : 'none';
         if (rw) rw.style.display  = p.viewMode === 'raw'   ? '' : 'none';
+        if (gw) gw.style.display  = p.viewMode === 'graph' ? 'flex' : 'none';
       }
       if (p.tableSort && typeof p.tableSort === 'object') {
         state.tableSort = { col: p.tableSort.col || null, dir: p.tableSort.dir === 'desc' ? 'desc' : 'asc' };
